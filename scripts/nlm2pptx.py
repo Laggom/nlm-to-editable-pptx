@@ -274,18 +274,32 @@ def build_pptx(bg_paths: list[str], ocr_blocks_per_slide: list[list[dict]],
             if not txt or not box or len(box) != 4:
                 continue
             ymin, xmin, ymax, xmax = box
-            x = Emu(int(xmin/1000 * EMU_W)); y = Emu(int(ymin/1000 * EMU_H))
-            w = Emu(int(max((xmax-xmin)/1000, 0.04) * EMU_W))
-            h = Emu(int(max((ymax-ymin)/1000, 0.02) * EMU_H))
+            # 텍스트 줄 높이 기준으로 폰트 산정: 한 줄 높이 ≈ font_size.
+            # OCR이 멀티라인 블록의 box를 전체 높이로 주므로 줄 수로 나눠 한 줄 높이 추정.
+            nlines = txt.count("\n") + 1
+            line_h_pt = (ymax - ymin) / 1000 * EMU_H / 12700.0 / max(nlines, 1)
             fp = float(b.get("font_size_pt") or 16)
-            # 폭 대비 글자수 안전 클램프 (모델 과대추정 방지)
-            longest = max((len(ln) for ln in txt.split("\n")), default=1)
-            box_w_pt = (xmax-xmin)/1000 * EMU_W / 12700.0
-            if longest > 0:
-                fp = min(fp, box_w_pt/(longest*0.55) * 1.25)
+            # 모델 폰트와 박스에서 역산한 줄 높이 중 작은 쪽 근처로 — 박스를 넘지 않게.
+            fp = min(fp, line_h_pt * 1.05)
             fp = max(8.0, min(fp, 48.0))
-            tb = slide.shapes.add_textbox(x, y, w, h)
-            tf = tb.text_frame; tf.word_wrap = True
+            # 박스: 좌상단은 OCR 좌표 그대로. 줄바꿈을 끄므로 너비는 텍스트가 담길 만큼.
+            x_emu = int(xmin/1000 * EMU_W); y_emu = int(ymin/1000 * EMU_H)
+            avail_pt = (EMU_W - x_emu) / 12700.0   # 시작점부터 슬라이드 우측 끝까지(pt)
+            # 한 줄(가장 긴 줄)의 추정 폭: 한글≈0.95·fp, 그 외≈0.52·fp 폭 가정.
+            def _line_w_pt(line, size):
+                wide = sum(1 for c in line if ord(c) > 0x1100)   # CJK 등 전각
+                return (wide * 0.95 + (len(line) - wide) * 0.52) * size
+            longest_line = max(txt.split("\n"), key=len) if txt else ""
+            # 폭이 가용 폭을 넘으면 폰트를 비례 축소(긴 한 줄 캡션이 오른쪽으로 잘리는 것 방지).
+            est = _line_w_pt(longest_line, fp)
+            if est > avail_pt and est > 0:
+                fp = max(8.0, fp * avail_pt / est)
+            need_pt = _line_w_pt(longest_line, fp) * 1.08 + 4   # 약간 여유
+            w = Emu(int(min(max(need_pt * 12700.0, 0.04 * EMU_W), EMU_W - x_emu)))
+            h = Emu(int(max((ymax-ymin)/1000, 0.02) * EMU_H))
+            tb = slide.shapes.add_textbox(Emu(x_emu), Emu(y_emu), w, h)
+            tf = tb.text_frame
+            tf.word_wrap = False  # 줄바꿈 금지 — OCR이 분리한 줄 단위를 그대로 유지
             tf.margin_left = tf.margin_right = tf.margin_top = tf.margin_bottom = 0
             tf.vertical_anchor = MSO_ANCHOR.MIDDLE
             p = tf.paragraphs[0]; p.alignment = ALIGN.get(b.get("align", "left"), PP_ALIGN.LEFT)
