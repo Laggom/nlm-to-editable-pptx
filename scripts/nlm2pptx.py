@@ -22,6 +22,40 @@ import urllib.request, urllib.error
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ──────────────────────────────────────────────────────────────────────────
+# .env 로더 (표준 라이브러리만 사용). CWD / 스크립트 디렉토리 / 그 상위에서
+# .env 를 찾아 KEY=VALUE 를 os.environ 에 채운다(기존 환경변수는 덮어쓰지 않음).
+# ──────────────────────────────────────────────────────────────────────────
+def _load_dotenv() -> None:
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(os.getcwd(), ".env"),
+        os.path.join(here, ".env"),
+        os.path.join(os.path.dirname(here), ".env"),
+    ]
+    seen = set()
+    for path in candidates:
+        if path in seen or not os.path.isfile(path):
+            continue
+        seen.add(path)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    if line.startswith("export "):
+                        line = line[len("export "):]
+                    name, _, value = line.partition("=")
+                    name = name.strip()
+                    value = value.strip().strip('"').strip("'")
+                    if name and name not in os.environ:
+                        os.environ[name] = value
+        except OSError:
+            pass
+
+_load_dotenv()
+
+# ──────────────────────────────────────────────────────────────────────────
 # 로깅: 타임스탬프 + 단계/슬라이드/소요시간. 콘솔 + (workdir 지정 시) 파일.
 # 환경변수 NLM2PPTX_LOG_LEVEL 로 조절(기본 INFO, 디버그는 DEBUG).
 # ──────────────────────────────────────────────────────────────────────────
@@ -250,6 +284,54 @@ def latex2plain(t: str) -> str:
 # ──────────────────────────────────────────────────────────────────────────
 # 4) PPTX 조립
 # ──────────────────────────────────────────────────────────────────────────
+_GLYPH_TO_FONT = 1.30     # 타이트 글리프박스 높이 → 폰트 pt 환산 계수(글자가 행 높이를 채우도록)
+_FONT_SAFETY = 0.98       # 글꼴 메트릭 오차 흡수(타이트 박스에서 강제 줄바꿈 방지)
+
+def _is_numeric_cell(t: str) -> bool:
+    """숫자/기호 위주의 표 셀인지 판정(우측정렬 대상).
+    OCR이 표 숫자의 정렬을 center/right로 들쭉날쭉 주므로 우측정렬로 통일하기 위함.
+    예: 19,671.3 / +4,540.8 / 190% / -1%p / 110.1"""
+    t = t.strip()
+    if not any(c.isdigit() for c in t):
+        return False
+    return len(t) <= 16 and all(c.isdigit() or c in " ,.%+-()원pP△▲▽▼" for c in t)
+
+def _em_width(s: str) -> float:
+    """문자열의 em 폭 합. CJK=1.0, 공백=0.4, 그 외=0.5."""
+    w = 0.0
+    for ch in s:
+        o = ord(ch)
+        if (0x1100 <= o <= 0x11FF or 0x2E80 <= o <= 0x9FFF or 0xAC00 <= o <= 0xD7A3 or
+                0xF900 <= o <= 0xFAFF or 0xFF00 <= o <= 0xFFEF or 0x3000 <= o <= 0x30FF):
+            w += 1.0
+        elif ch == " ":
+            w += 0.33
+        else:
+            w += 0.55         # 라틴/숫자(맑은 고딕 실측 근사)
+    return w
+
+def _wrap_intent(text: str) -> bool:
+    """줄바꿈을 허용할 '긴 문단'인지. 짧은 한 줄(라벨/숫자/제목)은 줄바꿈하지 않는다."""
+    return ("\n" in text) or (sum(_em_width(ln) for ln in text.split("\n")) > 16)
+
+def _fit_font(text: str, box_w_pt: float, box_h_pt: float) -> float:
+    """OCR 추정 대신 박스 기하로 폰트 pt 산정.
+    한 줄에 맞으면 박스 높이 기준, 넘치면 면적(폭×높이) 기준 → OCR 폰트 오차 자동 보정."""
+    lines = text.split("\n")
+    nlines = len(lines)
+    longest_em = max((_em_width(ln) for ln in lines), default=1.0) or 1.0
+    total_em = sum(_em_width(ln) for ln in lines) or 1.0
+    f_height = (box_h_pt / nlines) * _GLYPH_TO_FONT
+    if not _wrap_intent(text):
+        # 짧은 한 줄(라벨/숫자/제목): 박스 높이 기준 → 행 높이 같으면 크기도 균일.
+        # 폭의 1.1배까지만 허용(과도한 가로 오버플로 방지). 줄바꿈은 호출부에서 끈다.
+        f = min(f_height, box_w_pt / longest_em * 1.10)
+    elif longest_em * f_height <= box_w_pt:        # 여러 줄이지만 자연 크기로 들어감
+        f = f_height
+    else:                                          # 긴 문단 → 줄바꿈 후 높이 ≈ 박스 높이
+        f = (box_w_pt * box_h_pt / (1.2 * total_em)) ** 0.5
+    return max(8.0, min(f, 46.0))
+
 def build_pptx(bg_paths: list[str], ocr_blocks_per_slide: list[list[dict]],
                out_path: str, font: str | None = None) -> str:
     """배경 이미지 + 슬라이드별 OCR 블록 → 편집 가능 PPTX 저장."""
@@ -274,30 +356,36 @@ def build_pptx(bg_paths: list[str], ocr_blocks_per_slide: list[list[dict]],
             if not txt or not box or len(box) != 4:
                 continue
             ymin, xmin, ymax, xmax = box
-            x = Emu(int(xmin/1000 * EMU_W)); y = Emu(int(ymin/1000 * EMU_H))
-            w = Emu(int(max((xmax-xmin)/1000, 0.04) * EMU_W))
-            h = Emu(int(max((ymax-ymin)/1000, 0.02) * EMU_H))
-            fp = float(b.get("font_size_pt") or 16)
-            # 폭 대비 글자수 안전 클램프 (모델 과대추정 방지)
-            longest = max((len(ln) for ln in txt.split("\n")), default=1)
-            box_w_pt = (xmax-xmin)/1000 * EMU_W / 12700.0
-            if longest > 0:
-                fp = min(fp, box_w_pt/(longest*0.55) * 1.25)
-            fp = max(8.0, min(fp, 48.0))
-            tb = slide.shapes.add_textbox(x, y, w, h)
-            tf = tb.text_frame; tf.word_wrap = True
+            align = b.get("align", "left")
+            # 표 숫자 셀은 OCR align이 center/right로 혼재 → 우측정렬로 통일(열 가지런히)
+            if _is_numeric_cell(txt):
+                align = "right"
+            # 박스는 글자에 타이트하게 유지(폭 여유 X). 그래야 박스≈글자라 정렬 기준점이
+            # 보존되고 OCR align 오차의 영향이 최소화된다.
+            x = int(xmin/1000 * EMU_W); y = int(ymin/1000 * EMU_H)
+            w_emu = max((xmax-xmin)/1000, 0.04) * EMU_W
+            h_emu = max((ymax-ymin)/1000, 0.02) * EMU_H
+            # 폰트 크기: OCR 추정이 아니라 박스 기하로 산정(모순값 자동 보정)
+            fp = _fit_font(txt, w_emu/12700.0, h_emu/12700.0) * _FONT_SAFETY
+            tb = slide.shapes.add_textbox(Emu(x), Emu(y), Emu(int(w_emu)), Emu(int(h_emu)))
+            tf = tb.text_frame
+            # 긴 문단만 컬럼 폭에 맞춰 줄바꿈. 짧은 셀(숫자/라벨)은 줄바꿈 끔(약간 넘쳐도 깨지지 않게).
+            tf.word_wrap = _wrap_intent(txt)
+            tf.auto_size = None
             tf.margin_left = tf.margin_right = tf.margin_top = tf.margin_bottom = 0
-            tf.vertical_anchor = MSO_ANCHOR.MIDDLE
-            p = tf.paragraphs[0]; p.alignment = ALIGN.get(b.get("align", "left"), PP_ALIGN.LEFT)
-            run = p.add_run(); run.text = txt
-            run.font.size = Pt(round(fp, 1)); run.font.name = font
-            if b.get("bold"):
-                run.font.bold = True
+            tf.vertical_anchor = MSO_ANCHOR.TOP   # 위→아래로 흘러 이웃 블록 침범 방지
             col = (b.get("color") or "FFFFFF").replace("#", "")
-            try:
-                run.font.color.rgb = RGBColor.from_string(col if len(col) == 6 else "FFFFFF")
-            except Exception:
-                run.font.color.rgb = RGBColor.from_string("FFFFFF")
+            for j, line in enumerate(txt.split("\n")):
+                p = tf.paragraphs[0] if j == 0 else tf.add_paragraph()
+                p.alignment = ALIGN.get(align, PP_ALIGN.LEFT)
+                run = p.add_run(); run.text = line
+                run.font.size = Pt(round(fp, 1)); run.font.name = font
+                if b.get("bold"):
+                    run.font.bold = True
+                try:
+                    run.font.color.rgb = RGBColor.from_string(col if len(col) == 6 else "FFFFFF")
+                except Exception:
+                    run.font.color.rgb = RGBColor.from_string("FFFFFF")
     prs.save(out_path)
     return out_path
 
