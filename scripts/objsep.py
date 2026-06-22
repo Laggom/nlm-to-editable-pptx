@@ -1,17 +1,17 @@
-"""객체 분리(Object separation): 통이미지 슬라이드를 '편집 가능한 객체'로 분리해 PPTX 조립.
+"""표 분리(Table separation): 통이미지 슬라이드를 '글씨 + 표'로 만들어 PPTX 조립.
 
 레이어 구성:
-  (1) 배경 = 글자+객체 제거된 깨끗한 이미지(따로 생성, 원본 비율)
+  (1) 배경 = 글자 제거된 이미지에서 '표 영역만' 추가로 제거한 깨끗한 배경(원본 비율).
+      그림/차트/아이콘은 인식하지 않고 배경에 그대로 둔다(그림 인식 정확도가 낮아 제외).
   (2) 표 = 네이티브 PPTX 표(셀 텍스트=OCR 매핑, 열너비·행높이·셀색을 원본에서 추정)
-  (3) 그림/아이콘/차트 = 글자 지운 배경에서 크롭한 개별 이미지
-  (4) 그 외 글자 = 편집 가능한 텍스트박스
+  (3) 그 외 글자 = 편집 가능한 텍스트박스(표 셀 글자만 표에 흡수)
 
-검출기:
-  - C: gpt-5.5 비전이 객체+표구조 JSON 반환 (설치 불필요, API 비용)
-  - A: img2table(표 격자)+OpenCV(그림). 추가 API 없음 (선택 의존: img2table, opencv-python)
-  - hybrid(기본): 표=A 네이티브 표, 그림=C. A가 못 잡고 C가 구조를 준 표는 C 구조 사용.
+표 검출(hybrid):
+  - A: img2table(표 격자). 추가 API 없음 (선택 의존: img2table, opencv-python)
+  - C: gpt-5.5 비전이 표 구조 JSON 반환 (설치 불필요, 슬라이드당 1회). A가 못 잡은 표 보강.
+  미설치 시 표는 비전(C) 결과로 폴백. (그림/도형 객체는 검출해도 build_objsep에서 버림)
 
-build_pptx(텍스트만)와 달리 nlm2pptx.convert(..., objects=True)에서 호출된다.
+build_pptx(텍스트만)와 달리 nlm2pptx.convert(..., tables=True)에서 호출된다.
 """
 import base64, json, os, sys, time, urllib.request
 import numpy as np
@@ -34,13 +34,13 @@ ALIGN = {"left": PP_ALIGN.LEFT, "center": PP_ALIGN.CENTER, "right": PP_ALIGN.RIG
 _CROP_SEQ = 0
 
 # ───────────────────────── 검출기 C (gpt-5.5 비전) ─────────────────────────
-OBJ_PROMPT = """You are a slide LAYOUT analyzer. The image is one slide. Return ONLY JSON: {"objects":[...]}.
-Detect ONLY NON-TEXT visual objects, each as one block:
-- type: "image" (photo/illustration/figure), "icon" (logo/badge/pictogram), "chart" (bar/line/pie graph), or "table" (data grid).
-- box_2d: [ymin,xmin,ymax,xmax] in 0-1000 coords, TIGHT around the object.
-For "table" also include: n_rows, n_cols (integers), and cells: [{"r":int,"c":int,"text":str,"box_2d":[...]}] (r,c 0-based, row 0 = top/header).
-Do NOT output plain text, titles, bullets, or captions as objects (those are handled separately). Only real visual objects/tables.
-If there are none, return {"objects":[]}. Be precise with boxes."""
+OBJ_PROMPT = """You are a slide TABLE analyzer. The image is one slide. Return ONLY JSON: {"objects":[...]}.
+Detect ONLY data tables (a grid of rows and columns). For each table:
+- type: "table"
+- box_2d: [ymin,xmin,ymax,xmax] in 0-1000 coords, TIGHT around the table.
+- n_rows, n_cols (integers), and cells: [{"r":int,"c":int,"text":str,"box_2d":[...]}] (r,c 0-based, row 0 = top/header).
+Ignore photos, illustrations, icons, charts, and plain text/titles/bullets. If there are no tables, return {"objects":[]}.
+Be precise with cell boxes (they determine column widths and row heights)."""
 
 def detect_C(image_path, ocr_blocks=None, model=None, retries=3, api_key=None):
     key = nlm2pptx._api_key(api_key)
@@ -393,7 +393,9 @@ def _assemble_into(slide, bg_path, original_path, ocr_blocks, objects, font, tmp
 # ───────────────────────── 멀티슬라이드 빌드 ─────────────────────────
 def build_objsep(slide_pngs, bg_paths, ocr_per_slide, out_path, font=None,
                  detector="hybrid", det_cache_dir=None):
-    """원본 PNG + 글자지운 배경 + OCR블록 → 객체분리 PPTX. 슬라이드 크기는 원본 이미지 비율."""
+    """원본 PNG + 글자지운 배경 + OCR블록 → '글씨 + 표' PPTX. 슬라이드 크기는 원본 이미지 비율.
+    표만 네이티브 표로 분리하고, 그림/차트/아이콘은 인식하지 않고 배경에 그대로 둔다
+    (그림 인식 정확도가 낮아 제외). 표 검출은 hybrid(img2table + 비전 표 구조)."""
     global EMU_W, EMU_H
     font = font or nlm2pptx.DEFAULT_FONT
     det = _DETECTORS.get(detector, detect_hybrid)
@@ -412,6 +414,8 @@ def build_objsep(slide_pngs, bg_paths, ocr_per_slide, out_path, font=None,
             objs = det(orig, blocks)
             if dc:
                 json.dump(objs, open(dc, "w", encoding="utf-8"), ensure_ascii=False)
+        # 글씨 + 표만: 표만 객체로 분리하고 그림/차트/아이콘은 배경에 그대로 둔다(그림 인식 제외)
+        objs = [o for o in objs if o.get("type") == "table" and _table_valid(o)]
         slide = prs.slides.add_slide(prs.slide_layouts[6])
         _assemble_into(slide, bg, orig, blocks, objs, font, tmpdir)
     prs.save(out_path)

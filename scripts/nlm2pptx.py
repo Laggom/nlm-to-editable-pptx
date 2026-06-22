@@ -396,14 +396,14 @@ def build_pptx(bg_paths: list[str], ocr_blocks_per_slide: list[list[dict]],
 def convert(input_path: str, output_path: str, workdir: str | None = None,
             erase: bool = True, font: str | None = None,
             api_key: str | None = None, max_workers: int = 6,
-            objects: bool = False) -> str:
+            tables: bool = False) -> str:
     """전체 변환. erase=False면 원본 배경 위에 텍스트만 올림(빠름, 글자 잔존).
 
     슬라이드별 글자제거/OCR은 max_workers 개 스레드로 병렬 실행(I/O 바운드라 효과 큼).
     max_workers=1 이면 순차. workdir 지정 시 convert.log 에 전체 로그 기록.
 
-    objects=True 면 표/그림/차트를 개별 객체로 분리(표→네이티브 표, 그림→개별 이미지)하는
-    하이브리드 파이프라인 사용(objsep). 슬라이드당 비전 검출 1회 추가 호출. 기본은 글자만.
+    tables=True 면 표를 네이티브 PowerPoint 표로 분리(objsep). 그림/차트는 인식하지 않고
+    배경에 그대로 둔다. 표 검출에 슬라이드당 비전 1회 추가 호출. 기본은 글자만.
     """
     import tempfile
     t_start = time.time()
@@ -455,9 +455,9 @@ def convert(input_path: str, output_path: str, workdir: str | None = None,
 
         # 4) 조립
         t0 = time.time()
-        if objects:
+        if tables:
             import objsep
-            log.info(f"[4/4] 객체분리 조립(hybrid) → {output_path}")
+            log.info(f"[4/4] 글씨+표 조립(표 분리) → {output_path}")
             objsep.build_objsep(slide_pngs, bg_paths, ocr_results, output_path,
                                 font=font, det_cache_dir=os.path.join(workdir, "objsep_det"))
         else:
@@ -481,13 +481,13 @@ def _cli():
     ap.add_argument("--no-erase", action="store_true", help="글자 제거 생략(원본 배경 유지, 빠름)")
     ap.add_argument("--font", default=None, help=f"한글 폰트명(기본: {DEFAULT_FONT})")
     ap.add_argument("--workers", type=int, default=6, help="슬라이드 병렬 처리 수(기본 6, 1=순차)")
-    ap.add_argument("--objects", action="store_true",
-                    help="표/그림/차트를 개별 객체로 분리(표→네이티브 표, 그림→개별 이미지). "
-                         "하이브리드 검출, 슬라이드당 비전 호출 1회 추가")
+    ap.add_argument("--tables", action="store_true",
+                    help="표를 네이티브 PowerPoint 표로 분리(글씨+표). 그림/차트는 배경에 유지. "
+                         "표 검출에 슬라이드당 비전 호출 1회 추가")
     args = ap.parse_args()
     convert(args.input, args.output, workdir=args.workdir,
             erase=not args.no_erase, font=args.font, max_workers=args.workers,
-            objects=args.objects)
+            tables=args.tables)
 
 
 if __name__ == "__main__":

@@ -32,19 +32,20 @@ python scripts/nlm2pptx.py input.pptx output.pptx
 python scripts/nlm2pptx.py deck.pdf out.pptx --no-erase      # 빠른 모드(글자제거 생략)
 python scripts/nlm2pptx.py input.pptx out.pptx --workers 6   # 병렬(기본 6, 1=순차)
 python scripts/nlm2pptx.py input.pptx out.pptx --workdir ./wd  # 중간파일+convert.log 보존
-python scripts/nlm2pptx.py input.pptx out.pptx --objects     # 표/그림 개별 객체로 분리(아래 참고)
+python scripts/nlm2pptx.py input.pptx out.pptx --tables      # 표를 네이티브 표로 분리(아래 참고)
 ```
 
-### 객체 분리 (`--objects`)
+### 표 분리 (`--tables`)
 
-기본 변환은 "배경 이미지 + 편집 가능한 텍스트"만 만듭니다. `--objects` 를 주면 표·그림·차트를
-**개별 객체로 분리**합니다(하이브리드 검출):
+기본 변환은 "배경 이미지 + 편집 가능한 텍스트"만 만듭니다. `--tables` 를 주면 **표를
+편집 가능한 네이티브 PowerPoint 표로** 분리합니다:
 
-- **표** → 편집 가능한 **네이티브 PowerPoint 표** (셀 텍스트·열너비·행높이·셀색을 원본에서 추정)
-- **그림/아이콘/차트** → 글자 지운 배경에서 잘라낸 **개별 이미지**(이동·교체 가능)
-- **배경** → 글자와 객체를 모두 제거한 깨끗한 이미지(이중 그리기 없음), 슬라이드 비율은 원본에 맞춤
+- **표** → **네이티브 PowerPoint 표** (셀 텍스트·열너비·행높이·셀색을 원본에서 추정)
+- **그림/차트/아이콘** → 인식하지 않고 **배경에 그대로 둠** (그림 인식 정확도가 낮아 제외)
+- **배경** → 글자 + 표 영역을 제거한 깨끗한 이미지, 슬라이드 비율은 원본에 맞춤
+- 표 셀에 들어가는 글자만 표로 흡수, 나머지 글자는 모두 편집 가능한 텍스트로 유지
 
-표 검출(img2table)은 추가 API가 없고, 비전 검출(객체 인식)은 슬라이드당 1회 호출이 더 듭니다.
+표 검출은 hybrid(img2table + 비전 표 구조)이며 슬라이드당 비전 1회 호출이 추가됩니다.
 `img2table`, `opencv-python` 미설치 시 표는 비전 검출 결과로 폴백합니다(requirements 의 optional 항목).
 
 슬라이드별 글자제거/OCR은 기본 6스레드 병렬(12장 기준 전체 ~7분, `--no-erase` ~2.5분).
