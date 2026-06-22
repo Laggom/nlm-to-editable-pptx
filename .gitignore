@@ -7,3 +7,5 @@ workdir/
 *.html
 .DS_Store
 .env
+_crops/
+_objsep_tmp/
