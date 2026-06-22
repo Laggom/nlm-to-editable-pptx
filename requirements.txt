@@ -3,7 +3,7 @@ pillow>=10.0.0
 # only needed for PDF input
 pymupdf>=1.23.0
 
-# --- optional: object separation (--objects) ---
+# --- optional: table separation (--tables) ---
 # table grid detection
 img2table>=1.2.0
 # figure detection + background inpaint

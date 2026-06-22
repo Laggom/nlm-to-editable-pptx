@@ -9,3 +9,9 @@ workdir/
 .env
 _crops/
 _objsep_tmp/
+
+# examples/ 데모 산출물은 저장소에 포함 (위 제외 규칙의 예외)
+!examples/
+!examples/*.pptx
+!examples/*.html
+!examples/*.png
