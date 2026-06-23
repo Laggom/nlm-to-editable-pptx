@@ -82,6 +82,7 @@ OCR_MODEL   = os.environ.get("NLM2PPTX_OCR_MODEL", "gpt-5.5")          # OCR
 DEFAULT_FONT = os.environ.get("NLM2PPTX_FONT", "맑은 고딕")            # 한글 폰트(이름만 기입)
 OPENAI_BASE = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
 IMAGE_SIZE  = "1536x1024"   # 16:9 가로 (gpt-image 허용 사이즈)
+HTTP_TIMEOUT = int(os.environ.get("NLM2PPTX_HTTP_TIMEOUT", "400"))   # API 응답 대기(초). OCR 지연 대응
 
 
 def _api_key(explicit: str | None = None) -> str:
@@ -173,7 +174,7 @@ def erase_text(png_path: str, out_path: str, api_key: str | None = None,
                 f"{OPENAI_BASE}/images/edits", data=body,
                 headers={"Authorization": f"Bearer {key}",
                          "Content-Type": f"multipart/form-data; boundary={boundary}"})
-            d = json.loads(urllib.request.urlopen(req, timeout=200).read())
+            d = json.loads(urllib.request.urlopen(req, timeout=HTTP_TIMEOUT).read())
             b64 = d["data"][0]["b64_json"]
             with open(out_path, "wb") as f:
                 f.write(base64.b64decode(b64))
@@ -227,7 +228,7 @@ def ocr_slide(png_path: str, api_key: str | None = None,
                 f"{OPENAI_BASE}/chat/completions",
                 data=json.dumps(body).encode(),
                 headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
-            d = json.loads(urllib.request.urlopen(req, timeout=200).read())
+            d = json.loads(urllib.request.urlopen(req, timeout=HTTP_TIMEOUT).read())
             content = d["choices"][0]["message"]["content"]
             obj = json.loads(content)
             blocks = obj.get("blocks", obj if isinstance(obj, list) else [])
