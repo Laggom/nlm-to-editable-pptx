@@ -21,6 +21,8 @@ import base64, json, os, re, sys, time, uuid, zipfile, io, glob, argparse, loggi
 import urllib.request, urllib.error
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+__version__ = "1.1.0"
+
 # ──────────────────────────────────────────────────────────────────────────
 # .env 로더 (표준 라이브러리만 사용). CWD / 스크립트 디렉토리 / 그 상위에서
 # .env 를 찾아 KEY=VALUE 를 os.environ 에 채운다(기존 환경변수는 덮어쓰지 않음).
@@ -81,7 +83,7 @@ IMAGE_MODEL = os.environ.get("NLM2PPTX_IMAGE_MODEL", "gpt-image-2")   # 글자 �
 OCR_MODEL   = os.environ.get("NLM2PPTX_OCR_MODEL", "gpt-5.5")          # OCR
 DEFAULT_FONT = os.environ.get("NLM2PPTX_FONT", "맑은 고딕")            # 한글 폰트(이름만 기입)
 OPENAI_BASE = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
-IMAGE_SIZE  = "1536x1024"   # 16:9 가로 (gpt-image 허용 사이즈)
+IMAGE_SIZE  = "1536x1024"   # gpt-image 허용 가로 사이즈(3:2). 원본 비율은 레터박스로 보존(erase_text 참고).
 HTTP_TIMEOUT = int(os.environ.get("NLM2PPTX_HTTP_TIMEOUT", "400"))   # API 응답 대기(초). OCR 지연 대응
 
 
@@ -142,18 +144,46 @@ def extract_slides(input_path: str, out_dir: str) -> list[str]:
 # ──────────────────────────────────────────────────────────────────────────
 # 2) 글자 제거 (gpt-image-2, images/edits 멀티파트)
 # ──────────────────────────────────────────────────────────────────────────
+# composition-lock 프롬프트: "글자만 지운다"가 아니라 "비텍스트 픽셀은 손대지 마라"를 강하게 지시.
+# 단순 "remove text"보다 글자 잔존/엉뚱한 내용 생성(hallucinate)이 줄고, frame 내 재구성을 억제한다.
 ERASE_PROMPT = (
-    "Remove all text and letters from this image while preserving the background, "
-    "illustrations, diagrams, graphs, and all non-text visual elements exactly. "
-    "Do not add any new text. Keep the same composition, colors, and lighting."
+    "Remove ONLY the text and letters from this slide image. This is a PIXEL-PRESERVATION task, "
+    "NOT a creative regeneration. Keep the EXACT same composition: do NOT move, resize, shift, "
+    "crop, recolor, or redraw ANY non-text element. Every graph, axis, curve, diagram, "
+    "illustration, box, line, gridline, and background region MUST stay at the EXACT same "
+    "position and scale as the input — only the glyphs disappear, replaced by the background "
+    "that was behind them. Do NOT add any new text, marks, or labels, and do NOT invent content "
+    "in the cleared spots; fill them with the surrounding background only."
 )
+
+def _letterbox(im, tw: int, th: int):
+    """im을 tw×th 캔버스에 비율 유지(레터박스)로 배치. 반환 (padded, (left,top,w,h))."""
+    W, H = im.size
+    if W / H > tw / th:                 # 원본이 더 넓음 → 폭 맞추고 상하 여백
+        sw, sh = tw, max(1, round(tw * H / W)); left, top = 0, (th - sh) // 2
+    else:                               # 더 좁음 → 높이 맞추고 좌우 여백
+        sh, sw = th, max(1, round(th * W / H)); top, left = 0, (tw - sw) // 2
+    from PIL import Image
+    base = Image.new("RGB", (tw, th), (255, 255, 255))
+    base.paste(im.resize((sw, sh)), (left, top))
+    return base, (left, top, sw, sh)
 
 def erase_text(png_path: str, out_path: str, api_key: str | None = None,
                model: str | None = None, retries: int = 3) -> str:
-    """슬라이드 PNG에서 글자만 제거한 배경 이미지를 생성해 out_path에 저장."""
+    """슬라이드 PNG에서 글자만 제거한 배경 이미지를 생성해 out_path에 저장.
+
+    종횡비 보존: gpt-image는 출력 사이즈가 고정(IMAGE_SIZE)이라, 원본을 그대로 보내면
+    비율이 다를 때 모델이 내용을 재구성(reflow)해 레이아웃이 어긋난다. 그래서
+    (1) 원본을 IMAGE_SIZE 캔버스에 레터박스로 패딩해 전송 → 모델은 비율을 바꿀 필요가 없어
+    재구성하지 않고 글자만 지움 → (2) 받은 결과에서 패딩 영역을 크롭해 원본 비율을 복원한다.
+    """
+    from PIL import Image
     key = _api_key(api_key)
     model = model or IMAGE_MODEL
-    img = open(png_path, "rb").read()
+    tw, th = (int(v) for v in IMAGE_SIZE.lower().split("x"))
+    orig = Image.open(png_path).convert("RGB")
+    padded, (left, top, sw, sh) = _letterbox(orig, tw, th)
+    buf = io.BytesIO(); padded.save(buf, "PNG"); img = buf.getvalue()
     boundary = "----" + uuid.uuid4().hex
     def part_field(name, val):
         return (f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{val}\r\n').encode()
@@ -176,8 +206,10 @@ def erase_text(png_path: str, out_path: str, api_key: str | None = None,
                          "Content-Type": f"multipart/form-data; boundary={boundary}"})
             d = json.loads(urllib.request.urlopen(req, timeout=HTTP_TIMEOUT).read())
             b64 = d["data"][0]["b64_json"]
-            with open(out_path, "wb") as f:
-                f.write(base64.b64decode(b64))
+            res = Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
+            if res.size != (tw, th):                 # 안전망: 결과가 요청 사이즈와 다르면 맞춤
+                res = res.resize((tw, th))
+            res.crop((left, top, left + sw, top + sh)).save(out_path)   # 패딩 크롭 → 원본 비율 복원
             log.info(f"erase {name}: OK ({time.time()-t0:.1f}s)")
             return out_path
         except urllib.error.HTTPError as e:
